@@ -1,0 +1,671 @@
+diff --git a/dm/gfx/nvn/hle_nvn.c b/dm/gfx/nvn/hle_nvn.c
+index 1a313a2..cffed55 100644
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -1683,6 +1683,23 @@ static int fstep_hold(void) {
+     }
+     return h;
+ }
++// DM_FPS_KEEP60=1: below thermal state "serious" (and outside Low Power Mode), late frames still raise the hold, but the controller probes back to the cap whatever the cost,
++// and the wait between probes doubles after a failed one only up to KEEP60_HOLD_MAX (4 s; 8 s without it). An iPhone lowers the GPU clock at the longer hold (BotW: GPU 1.7-2.0x
++// its time at hold 1), so the cost seen at 30 fps says little about 60, and the 8 s hold-off kept a cool device at 30 for good; probing every second instead (the first version)
++// failed 42 of 52 times in BotW's shrines, three late frames each. The thermal cap (thermal_capped) still holds 30 once the device is serious
++#define KEEP60_HOLD_MAX (FSTEP_HOLD0 * 4)
++static int fstep_keep60(void) {
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("DM_FPS_KEEP60"); on = e && atoi(e) != 0; if (on) LOG("[nvn] frame step: probing back to the cap every second while the device is cool (DM_FPS_KEEP60)"); }
++    return on && dm_thermal_now() <= 1 && !dm_low_power_now();
++}
++// DM_FPS_HOLD_MAX=<1-3>: the longest hold late frames may raise (in vsyncs; 0 / unset = FSTEP_MAX). BotW sets 2: in its shrines a frame's GPU time reached 2.0-2.4 vsyncs,
++// which stepped to hold 3 (20 fps) with dropped frames on top; held at 2, such frames come a little late and the step pays the time back, so the game keeps real time near 30 fps
++static int fstep_hold_max(void) {
++    static int m = -1;
++    if (m < 0) { const char *e = getenv("DM_FPS_HOLD_MAX"); m = e ? atoi(e) : 0; if (m < 0 || m > FSTEP_MAX) m = 0; if (m) LOG("[nvn] frame step: frames held at most %d vsyncs (DM_FPS_HOLD_MAX)", m); }
++    return m;
++}
+ // Once per present, before this frame's period is taken: the time since the previous frame's start (shown) and the frame's cost decide this frame's hold and the next frame's step.
+ // Cost = max(CPU: the time between the frames' starts without the pacing wait, GPU: the latest finished frame's GPU time), in vsyncs
+ static void fstep_tick(const win_t *o) {
+@@ -1693,6 +1710,7 @@ static void fstep_tick(const win_t *o) {
+     for (uint64_t f = g_frame; f-- > 0 && g_frame - f <= 8;) { double g = mtl_gpu_ms(f); if (g >= 0) { gpu = g * 1e6 / v; break; } }
+     double cpu = shown - pw / v, cost = cpu > gpu ? cpu : gpu;
+     int c = fps_step_cap(), kmin = 60 / c, kmax = !fstep_hold() ? kmin : kmin >= 2 ? 2 : FSTEP_MAX, k0 = g_fs.k, kmin0 = g_fs.kmin, probe0 = g_fs.probe;
++    if (fstep_hold_max() && kmax > fstep_hold_max()) kmax = fstep_hold_max() < kmin ? kmin : fstep_hold_max();
+     int fixed = (int)__atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED);
+     uint64_t probes0 = g_fs.probes, failed0 = g_fs.failed;
+     // A screen whose rate is not a multiple of 60 (144, 165 Hz) shows the link's 1/60 s ticks on their nearest refreshes (nvn_mtl.m link_range), so a frame on time can show for one
+@@ -1712,7 +1730,9 @@ static void fstep_tick(const win_t *o) {
+         slow_bits = (uint16_t)(slow_bits << 1 | (shown > k + FSTEP_LATE));
+         if (__builtin_popcount(slow_bits) >= 12) g_fs.screen = 2;
+     }
+-    int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed, cslow || gslow);
++    int keep60 = fstep_keep60();
++    if (keep60 && g_fs.hold > KEEP60_HOLD_MAX) g_fs.hold = KEEP60_HOLD_MAX;   // the back-off stops at 4 s
++    int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed, cslow || gslow || keep60);
+     __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED); atomic_store(&g_fs_k, g_fs.k);
+     held[g_fs.k]++; if (fixed) fixed_sum += (uint64_t)n;   // the stubs count only the host's steps
+     static int fixed_was, nfix;
+diff --git a/dm/host/hle_time.c b/dm/host/hle_time.c
+index d74039d..29483b8 100644
+--- a/dm/host/hle_time.c
++++ b/dm/host/hle_time.c
+@@ -94,6 +94,10 @@ HLE_FORCE("_ZN2nn4time13ClockSnapshot29CreateWithStandardSystemClockEPS1_", "sna
+     tzset(); strlcpy((char *)s + 0xa8, tzname[0] && *tzname[0] ? tzname[0] : "UTC", 0x24);
+     return RES_OK;
+ }
++// The adjustable clock's snapshot (Tomodachi Life: Living the Dream, SDK 20: sdk+0x4406f8 aborts when the service call fails): the adjustable user clock is the host's user clock
++// (h_time_AdjGetCurrentTime above), so the same snapshot; the SDK asks the service with type 2
++HLE_FORCE("_ZN2nn4time13ClockSnapshot31CreateWithAdjustableSystemClockEPS1_", "adjustable clock snapshot from the time service; the host fills it as the standard one",
++          Result, h_time_AdjSnapshot, uint8_t *s) { Result r = h_time_Snapshot(s); s[0xcd] = 2; return r; }
+ // Arithmetic on two snapshots: the SDK hands both to the time service (a call through its session, AbortImpl when there is none: STEINS;GATE RE:BOOT's and Tears of the Kingdom's SDK;
+ // Tears of the Kingdom imports both); the host computes what the service does (as Ryujinx's time service). TimeSpan is nanoseconds
+ static int64_t snap64(const uint8_t *s, int off) { int64_t v; memcpy(&v, s + off, 8); return v; }
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index c3ac8c1..62610f0 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -11,6 +11,11 @@
+ //   Everything hugs the edges and corners to leave the picture room; controls sit over the picture, one CAShapeLayer each: a press only swaps the fill, a stick only moves its knob, nothing redraws the whole screen.
+ //   Touches no control takes (in 3D, those outside the right third) go to the game's touch screen (pushGame; Super Mario Galaxy's pointer in handheld mode).
+ //   The virtual gamepad (layout button included) hides while a physical controller is connected and comes back when it is removed; meanwhile every touch goes to the game. Physical controllers keep every button (D-pad and right stick included) and map by position: bottom = B, right = A, left = Y, top = X (same positions as on a Switch controller).
++//   Editing (2D / 3D): holding the layout button for 0.6 s enters edit mode: each control group (left stick, diamond, D-pad, ZL+L, ZR+R, −, +, L3, R3) is dragged to move and pinched
++//     with two fingers to resize; Reset brings back this layout's defaults, Done saves. Kept per layout in the game's own store (dm_user_defaults: per game, per device), as offsets
++//     in u (so they follow the screen's size) and a scale; the hit areas follow what is drawn. No input reaches the game while editing.
++//   Face buttons: as on a Switch (default) or by label as on an Xbox controller (the bottom button is A), set by the launcher separately for physical controllers (DM_PAD_ABXY)
++//     and the on-screen diamond (DM_TOUCH_ABXY).
+ //   Shaking the phone shakes the controller (DM_BTN_SHAKE: its six-axis sensor, hle_hid.c), whichever controls are in use; see "Shaking the phone" below.
+ #import <UIKit/UIKit.h>
+ #import <GameController/GameController.h>
+@@ -90,9 +95,21 @@ static void motion_start(void) {
+     K_RSWIPE = 1.0 / 3,                             // right stick area: this fraction of the screen width from the right edge (not in u)
+     K_CLICK_X = 102, K_CLICK_R = 17;                // L3 / R3: centre from the outer edge (level with ZL / ZR), radius
+ static const int k_btns[] = {B_ZL, B_L, B_ZR, B_R, B_MINUS, B_PLUS, B_LS, B_RS};   // keys locked at touch-down (L3 / R3 only in the 3D layout)
++NSUserDefaults *dm_user_defaults(void);   // main.m: the app's store, or this game's own in a multi-game launcher
+ static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2D, 1 = 3D, 2 = Tap (DM_GAME_PAD_LAYOUT's numbers)
+ int dm_opmode(void);   // hle_oe.c: 0 = handheld
+ 
++// The face-button layouts the launcher sets (each "nintendo" or "xbox"): DM_PAD_ABXY for physical controllers, DM_TOUCH_ABXY for the on-screen diamond. Xbox = by label as on an
++// Xbox controller (bottom A, right B, left X, top Y); Nintendo = as on a Switch (right A, bottom B, top X, left Y)
++static BOOL abxy_xbox(const char *var) {
++    const char *e = getenv(var); BOOL x = e && !strcmp(e, "xbox");
++    LOG("front end: %s %s", var, x ? "xbox (bottom A, right B, left X, top Y)" : "nintendo (right A, bottom B, top X, left Y)");
++    return x;
++}
++static BOOL pad_xbox(void) { static int x = -1; if (x < 0) x = abxy_xbox("DM_PAD_ABXY"); return x; }
++static BOOL touch_xbox(void) { static int x = -1; if (x < 0) x = abxy_xbox("DM_TOUCH_ABXY"); return x; }
++enum { G_STICK = 0, G_FACE, G_DPAD, G_LDROP, G_RDROP, G_MINUS, G_PLUS, G_L3, G_R3, G_N };   // control groups moved and resized together in edit mode
++static const CGFloat K_SCALE_MIN = 0.6, K_SCALE_MAX = 1.8, K_EDIT_HOLD = 0.6;
+ @interface DmGamepad : UIView
+ @end
+ static __weak DmGamepad *g_view;
+@@ -113,6 +130,11 @@ @implementation DmGamepad {
+     CALayer *_controls;                            // holds every control layer: hidden while a physical controller is connected (the view itself stays, for game touches)
+     BOOL _padOff;                                  // a physical controller is connected: every touch goes to the game
+     UITouch *_game[16];                            // touches on the game's touch screen by finger slot
++    CGPoint _off[G_N]; CGFloat _scl[G_N];          // the user's layout for the current layout: group offsets (in u) and scales
++    BOOL _edit, _swapLong;                         // edit mode; the layout button was held long enough to enter it (its release does not switch layouts)
++    NSMapTable<UITouch *, NSNumber *> *_editGroup; NSMapTable<UITouch *, NSValue *> *_editStart;   // edit mode: the group each touch holds, and where it was when the group's gesture last changed
++    CGPoint _editOff0[G_N]; CGFloat _editScl0[G_N], _editDist0[G_N];   // the group's offset and scale when its current gesture began, and the pinch's starting distance
++    CAShapeLayer *_editBtn[2]; CATextLayer *_editLabel[2], *_editHint;   // Reset / Done, and the hint line
+ }
+ 
+ static UIColor *k_idle, *k_on, *k_line, *k_ringFill, *k_text, *k_textOn;
+@@ -138,6 +160,8 @@ - (instancetype)initWithFrame:(CGRect)f {
+             [_touchFeedback prepare];
+         }
+         _owner = [NSMapTable strongToStrongObjectsMapTable]; _faceOf = [NSMapTable strongToStrongObjectsMapTable];
++        _editGroup = [NSMapTable strongToStrongObjectsMapTable]; _editStart = [NSMapTable strongToStrongObjectsMapTable];
++        for (int g = 0; g < G_N; g++) _scl[g] = 1;
+         static dispatch_once_t once;
+         dispatch_once(&once, ^{
+             // each colour carries its own low opacity instead of lowering the whole view's alpha (that would add an off-screen pass for the full-screen layer)
+@@ -155,10 +179,15 @@ - (instancetype)initWithFrame:(CGRect)f {
+             if (names[b]) _label[b] = label(_key[b], names[b]);   // the D-pad arms carry no label
+         }
+         _swap = shape(_controls); _swapLabel = label(_swap, @"");
+-        NSNumber *saved = [NSUserDefaults.standardUserDefaults objectForKey:k_layout_key];
++        NSNumber *saved = [dm_user_defaults() objectForKey:k_layout_key];
+         int l = saved ? (int)saved.integerValue : DM_GAME_PAD_LAYOUT;
+         if (l == 2 && dm_opmode() != 0) l = 0;   // Tap only in handheld mode (env.txt's DM_OPMODE may have changed it)
+         _full = l == 1; _tap = l == 2;
++        [self loadEdit];
++        BOOL ko = [NSLocale.preferredLanguages.firstObject hasPrefix:@"ko"];
++        for (int i = 0; i < 2; i++) { _editBtn[i] = shape(self.layer); _editBtn[i].fillColor = [UIColor colorWithWhite:0 alpha:0.55].CGColor; _editBtn[i].hidden = YES;
++            _editLabel[i] = label(self.layer, i ? (ko ? @"완료" : @"Done") : (ko ? @"기본값" : @"Reset")); _editLabel[i].foregroundColor = UIColor.whiteColor.CGColor; _editLabel[i].hidden = YES; }
++        _editHint = label(self.layer, ko ? @"드래그: 이동 · 두 손가락: 크기" : @"Drag to move · Pinch to resize"); _editHint.foregroundColor = UIColor.whiteColor.CGColor; _editHint.hidden = YES;
+         [self applyLayout];
+         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+         [nc addObserver:self selector:@selector(padsChanged) name:GCControllerDidConnectNotification object:nil];
+@@ -179,34 +208,119 @@ - (void)nextLayout {   // 2D → 3D (→ Tap in handheld mode) → 2D: release e
+     int l = _tap ? 0 : _full ? (dm_opmode() == 0 ? 2 : 0) : 1;
+     [self reset];
+     _full = l == 1; _tap = l == 2;
+-    [NSUserDefaults.standardUserDefaults setObject:@(l) forKey:k_layout_key];
++    [self loadEdit];
++    [dm_user_defaults() setObject:@(l) forKey:k_layout_key];
+     [self applyLayout]; [self setNeedsLayout];
+ }
+ 
++// ---- The user's layout (edit mode) ----
++- (NSString *)editKey { return [NSString stringWithFormat:@"DmPadEdit%d", _full ? 1 : 0]; }   // one per layout (2D, 3D); Tap has no controls
++- (void)loadEdit {
++    NSArray *a = [dm_user_defaults() arrayForKey:self.editKey];
++    for (int g = 0; g < G_N; g++) {
++        NSArray *e = g < (int)a.count && [a[g] isKindOfClass:NSArray.class] && [a[g] count] == 3 ? a[g] : nil;
++        _off[g] = e ? CGPointMake([e[0] doubleValue], [e[1] doubleValue]) : CGPointZero;
++        _scl[g] = e ? fmin(fmax([e[2] doubleValue], K_SCALE_MIN), K_SCALE_MAX) : 1;
++    }
++}
++- (void)saveEdit {
++    NSMutableArray *a = [NSMutableArray array]; BOOL any = NO;
++    for (int g = 0; g < G_N; g++) { [a addObject:@[@(_off[g].x), @(_off[g].y), @(_scl[g])]]; any |= _off[g].x != 0 || _off[g].y != 0 || _scl[g] != 1; }
++    if (any) [dm_user_defaults() setObject:a forKey:self.editKey]; else [dm_user_defaults() removeObjectForKey:self.editKey];
++    LOG("front end: touch layout %s %s", _full ? "3D" : "2D", any ? "saved" : "back to the defaults");
++}
++- (CGRect)editBtnRect:(int)i { CGRect s = self.safe; CGFloat u = self.u, w = 96 * u, h = 40 * u;
++    return CGRectMake(CGRectGetMidX(s) + (i ? 8 * u : -8 * u - w), CGRectGetMidY(s) - h / 2, w, h); }
++- (void)layoutEdit {
++    CGFloat u = self.u;
++    for (int i = 0; i < 2; i++) { CGRect r = [self editBtnRect:i]; setPath(_editBtn[i], CGPathCreateWithRoundedRect(r, r.size.height / 2, r.size.height / 2, NULL));
++        placeLabel(_editLabel[i], CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)), 16 * u); _editLabel[i].frame = CGRectInset(_editLabel[i].frame, -20 * u, 0); }
++    CGRect s = self.safe; placeLabel(_editHint, CGPointMake(CGRectGetMidX(s), CGRectGetMidY(s) - 44 * u), 15 * u); _editHint.frame = CGRectInset(_editHint.frame, -160 * u, 0);
++    for (int i = 0; i < 2; i++) { _editBtn[i].hidden = _editLabel[i].hidden = !_edit; }
++    _editHint.hidden = !_edit;
++}
++- (int)groupAt:(CGPoint)p {   // the group under a touch in edit mode: small controls first
++    if (CGRectContainsPoint(CGRectInset([self pillRect:B_MINUS], -6, -6), p)) return G_MINUS;
++    if (CGRectContainsPoint(CGRectInset([self pillRect:B_PLUS], -6, -6), p)) return G_PLUS;
++    if (_full) for (int b = B_LS; b <= B_RS; b++) if (dist(p, [self clickCenter:b]) <= [self clickR:b] * 1.4) return b == B_RS ? G_R3 : G_L3;
++    for (int b = B_L; b <= B_ZR; b++) if (dist(p, [self dropCenter:b]) <= [self dropR:b] * 1.4) return dropGroup(b);
++    if (_full && dist(p, self.dpadCenter) <= self.dpadR * 1.15) return G_DPAD;
++    if (dist(p, self.faceCenter) <= self.faceGap + self.faceR * 1.2) return G_FACE;
++    if (dist(p, self.stickHome) <= [self stickR:0] * 1.1) return G_STICK;
++    return -1;
++}
++- (void)rebaseGroup:(int)g {   // a touch joined or left the group: its gesture starts again from where things are now (no jump)
++    NSMutableArray<UITouch *> *ts = [NSMutableArray array];
++    for (UITouch *t in _editGroup) if ([_editGroup objectForKey:t].intValue == g) { [ts addObject:t]; [_editStart setObject:[NSValue valueWithCGPoint:[t locationInView:self]] forKey:t]; }
++    _editOff0[g] = _off[g]; _editScl0[g] = _scl[g];
++    _editDist0[g] = ts.count >= 2 ? fmax(dist([ts[0] locationInView:self], [ts[1] locationInView:self]), 1) : 0;
++}
++- (void)setEdit:(BOOL)on {
++    [self reset]; _edit = on; [_editGroup removeAllObjects]; [_editStart removeAllObjects];
++    if (!on) [self saveEdit];
++    [self setNeedsLayout]; [self refresh];
++}
++- (void)swapHeldLong { if (_swapHeld && !_tap && !_padOff) { _swapLong = YES; [_touchFeedback impactOccurredWithIntensity:1]; [self setEdit:YES]; } }
++- (void)editBegan:(NSSet<UITouch *> *)ts {
++    for (UITouch *t in ts) {
++        CGPoint p = [t locationInView:self];
++        if (CGRectContainsPoint([self editBtnRect:1], p)) { [self setEdit:NO]; return; }   // Done
++        if (CGRectContainsPoint([self editBtnRect:0], p)) { for (int g = 0; g < G_N; g++) { _off[g] = CGPointZero; _scl[g] = 1; } [self setNeedsLayout]; continue; }   // Reset (saved with Done)
++        int g = [self groupAt:p]; if (g < 0) continue;
++        [_editGroup setObject:@(g) forKey:t]; [self rebaseGroup:g];
++    }
++}
++- (void)editMoved {
++    CGFloat u = self.u;
++    for (int g = 0; g < G_N; g++) {
++        NSMutableArray<UITouch *> *ts = [NSMutableArray array];
++        for (UITouch *t in _editGroup) if ([_editGroup objectForKey:t].intValue == g) [ts addObject:t];
++        if (!ts.count) continue;
++        if (ts.count >= 2 && _editDist0[g] > 0) {
++            CGFloat d = dist([ts[0] locationInView:self], [ts[1] locationInView:self]);
++            _scl[g] = fmin(fmax(_editScl0[g] * d / _editDist0[g], K_SCALE_MIN), K_SCALE_MAX);
++        } else {
++            CGPoint p = [ts[0] locationInView:self], s = [[_editStart objectForKey:ts[0]] CGPointValue];
++            _off[g] = CGPointMake(_editOff0[g].x + (p.x - s.x) / u, _editOff0[g].y + (p.y - s.y) / u);
++        }
++    }
++    [self setNeedsLayout];
++}
++- (void)editEnded:(NSSet<UITouch *> *)ts {
++    for (UITouch *t in ts) { NSNumber *g = [_editGroup objectForKey:t]; [_editGroup removeObjectForKey:t]; [_editStart removeObjectForKey:t]; if (g) [self rebaseGroup:g.intValue]; }
++}
++
+ // ---- Layout (points; computed inside the safe area) ----
+ - (CGRect)safe { return UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets); }
+ - (CGRect)corner { UIEdgeInsets i = self.safeAreaInsets; i.left *= K_CORNER_IN; i.right *= K_CORNER_IN; return UIEdgeInsetsInsetRect(self.bounds, i); }   // the rectangle the bottom-corner controls use
+ - (CGFloat)u { return MIN(self.bounds.size.height / 430.0, 1.3); }   // 1 = 430 points tall (iPhone Pro Max landscape)
+ static CGPoint side(CGRect s, int right, CGFloat dx, CGFloat y) { return CGPointMake(right ? CGRectGetMaxX(s) - dx : CGRectGetMinX(s) + dx, y); }
+-- (CGPoint)faceCenter { CGRect s = self.corner; CGFloat u = self.u; return side(s, 1, K_FACE_X * u, CGRectGetMaxY(s) - K_PAD_Y * u); }
+-- (CGFloat)faceGap { return K_FACE_GAP * self.u; }
+-- (CGFloat)faceR { return K_FACE_R * self.u; }
++- (CGPoint)off:(int)g { CGFloat u = self.u; return CGPointMake(_off[g].x * u, _off[g].y * u); }
++static CGPoint addp(CGPoint a, CGPoint b) { return CGPointMake(a.x + b.x, a.y + b.y); }
++- (CGPoint)faceCenter { CGRect s = self.corner; CGFloat u = self.u; return addp(side(s, 1, K_FACE_X * u, CGRectGetMaxY(s) - K_PAD_Y * u), [self off:G_FACE]); }
++- (CGFloat)faceGap { return K_FACE_GAP * self.u * _scl[G_FACE]; }
++- (CGFloat)faceR { return K_FACE_R * self.u * _scl[G_FACE]; }
+ - (CGPoint)facePos:(int)b { CGPoint c = self.faceCenter; CGFloat g = self.faceGap;
++    if (touch_xbox()) switch (b) { case B_A: return CGPointMake(c.x, c.y + g); case B_B: return CGPointMake(c.x + g, c.y); case B_X: return CGPointMake(c.x - g, c.y); default: return CGPointMake(c.x, c.y - g); }   // Xbox: A bottom, B right, X left, Y top
+     switch (b) { case B_A: return CGPointMake(c.x + g, c.y); case B_B: return CGPointMake(c.x, c.y + g); case B_X: return CGPointMake(c.x, c.y - g); default: return CGPointMake(c.x - g, c.y); } }
+-- (CGPoint)stickHome { CGRect s = self.corner; return side(s, 0, K_STICK_X * self.u, CGRectGetMaxY(s) - K_PAD_Y * self.u); }   // the left stick's ring centre
++- (CGPoint)stickHome { CGRect s = self.corner; return addp(side(s, 0, K_STICK_X * self.u, CGRectGetMaxY(s) - K_PAD_Y * self.u), [self off:G_STICK]); }   // the left stick's ring centre
+ - (CGPoint)stickCentre:(int)i { return i ? _rCentre : self.stickHome; }
+-- (CGFloat)stickR:(int)i { return (i ? K_RSTICK_R : K_STICK_R) * self.u; }
++- (CGFloat)stickR:(int)i { return i ? K_RSTICK_R * self.u : K_STICK_R * self.u * _scl[G_STICK]; }
+ - (BOOL)inRightArea:(CGPoint)p { CGRect b = self.bounds; return p.x >= CGRectGetMaxX(b) - b.size.width * K_RSWIPE; }
+-- (CGPoint)dpadCenter { CGRect s = self.corner; CGFloat u = self.u; return side(s, 0, K_LOW_X * u, CGRectGetMaxY(s) - K_LOW_Y * u); }
+-- (CGFloat)dpadR { return K_DPAD_R * self.u; }
++- (CGPoint)dpadCenter { CGRect s = self.corner; CGFloat u = self.u; return addp(side(s, 0, K_LOW_X * u, CGRectGetMaxY(s) - K_LOW_Y * u), [self off:G_DPAD]); }
++- (CGFloat)dpadR { return K_DPAD_R * self.u * _scl[G_DPAD]; }
+ static BOOL isDrop(int b) { return b == B_ZL || b == B_L || b == B_ZR || b == B_R; }
+ static BOOL isClick(int b) { return b == B_LS || b == B_RS; }
+-- (CGPoint)dropCenter:(int)b { CGRect s = self.safe; CGFloat u = self.u; BOOL z = b == B_ZL || b == B_ZR;
+-    return side(s, b == B_ZR || b == B_R, (z ? K_ZL_X : K_L_X) * u, CGRectGetMinY(s) + (z ? K_ZL_Y : K_L_Y) * u); }
+-- (CGFloat)dropR:(int)b { return (b == B_ZL || b == B_ZR ? K_ZL_R : K_L_R) * self.u; }
+-- (CGPoint)clickCenter:(int)b { CGRect s = self.safe; CGFloat u = self.u; return side(s, b == B_RS, K_CLICK_X * u, CGRectGetMinY(s) + K_ZL_Y * u); }
+-- (CGRect)pillRect:(int)b { CGRect s = self.safe; CGFloat u = self.u, w = K_PILL_W * u, h = K_PILL_H * u;
+-    CGPoint c = CGPointMake(CGRectGetMidX(s) + (b == B_PLUS ? K_PILL_DX : -K_PILL_DX) * u, CGRectGetMinY(s) + K_PILL_Y * u);   // − on the left, + on the right
++static int dropGroup(int b) { return b == B_ZR || b == B_R ? G_RDROP : G_LDROP; }
++- (CGPoint)dropCenter:(int)b { CGRect s = self.safe; CGFloat u = self.u; BOOL right = b == B_ZR || b == B_R, z = b == B_ZL || b == B_ZR; int g = dropGroup(b);
++    CGPoint zc = addp(side(s, right, K_ZL_X * u, CGRectGetMinY(s) + K_ZL_Y * u), [self off:g]);   // ZL / ZR anchors the column; L / R keeps its distance, scaled with the group
++    if (z) return zc;
++    return CGPointMake(zc.x + (right ? -1 : 1) * (K_L_X - K_ZL_X) * u * _scl[g], zc.y + (K_L_Y - K_ZL_Y) * u * _scl[g]); }
++- (CGFloat)dropR:(int)b { return (b == B_ZL || b == B_ZR ? K_ZL_R : K_L_R) * self.u * _scl[dropGroup(b)]; }
++- (CGPoint)clickCenter:(int)b { CGRect s = self.safe; CGFloat u = self.u; return addp(side(s, b == B_RS, K_CLICK_X * u, CGRectGetMinY(s) + K_ZL_Y * u), [self off:b == B_RS ? G_R3 : G_L3]); }
++- (CGFloat)clickR:(int)b { return K_CLICK_R * self.u * _scl[b == B_RS ? G_R3 : G_L3]; }
++- (CGRect)pillRect:(int)b { CGRect s = self.safe; CGFloat u = self.u; int g = b == B_PLUS ? G_PLUS : G_MINUS; CGFloat w = K_PILL_W * u * _scl[g], h = K_PILL_H * u * _scl[g];
++    CGPoint c = addp(CGPointMake(CGRectGetMidX(s) + (b == B_PLUS ? K_PILL_DX : -K_PILL_DX) * u, CGRectGetMinY(s) + K_PILL_Y * u), [self off:g]);   // − on the left, + on the right
+     return CGRectMake(c.x - w / 2, c.y - h / 2, w, h); }
+ - (CGPoint)swapCenter { CGRect s = self.safe; return CGPointMake(CGRectGetMidX(s), CGRectGetMinY(s) + K_PILL_Y * self.u); }
+ 
+@@ -216,7 +330,7 @@ - (int)btnAt:(CGPoint)p {   // locked keys (tested on touch-down only, then lock
+     for (int i = 0; i < (int)(sizeof k_btns / sizeof *k_btns); i++) { int b = k_btns[i];
+         if (fullOnly(b) && !_full) continue;
+         BOOL hit = isDrop(b) ? dist(p, [self dropCenter:b]) <= [self dropR:b] * 1.35
+-                 : isClick(b) ? dist(p, [self clickCenter:b]) <= K_CLICK_R * u * 1.35
++                 : isClick(b) ? dist(p, [self clickCenter:b]) <= [self clickR:b] * 1.35
+                  : CGRectContainsPoint(CGRectInset([self pillRect:b], -8 * u, -8 * u), p);
+         if (hit) return b; }
+     return -1;
+@@ -294,12 +408,14 @@ - (BOOL)gameBegin:(UITouch *)t {
+     return NO;
+ }
+ - (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
++    if (_edit) { [self editBegan:ts]; return; }
+     BOOL game = NO;
+     for (UITouch *t in ts) {
+         if (_padOff) { game |= [self gameBegin:t]; continue; }
+         CGPoint p = [t locationInView:self]; int hit = _tap ? -1 : [self btnAt:p];
+         if (hit >= 0) { [_owner setObject:@(C_BTN | (uint64_t)hit << 8) forKey:t]; continue; }
+-        if ([self inSwap:p]) { [_owner setObject:@(C_SWAP) forKey:t]; continue; }
++        if ([self inSwap:p]) { [_owner setObject:@(C_SWAP) forKey:t]; _swapLong = NO;   // held K_EDIT_HOLD: edit mode instead of the next layout
++            [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(swapHeldLong) object:nil]; [self performSelector:@selector(swapHeldLong) withObject:nil afterDelay:K_EDIT_HOLD]; continue; }
+         if (_tap) { game |= [self gameBegin:t]; continue; }
+         // diamond, D-pad, left stick: take the one with the smallest distance / grab radius, if it is <= 1
+         CGFloat best = 1; int kind = C_NONE, idx = 0;
+@@ -316,6 +432,7 @@ - (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
+     [self recompute];
+ }
+ - (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
++    if (_edit) { [self editMoved]; return; }
+     BOOL game = NO;
+     for (UITouch *t in ts) {
+         uint64_t v = [_owner objectForKey:t].unsignedLongLongValue; int c = (int)(v & 0xff); CGPoint p = [t locationInView:self];
+@@ -329,10 +446,12 @@ - (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
+     [self recompute];
+ }
+ - (void)endTouches:(NSSet<UITouch *> *)ts tapped:(BOOL)ended {
++    if (_edit) { [self editEnded:ts]; return; }
+     BOOL swap = NO, game = NO;
+     for (UITouch *t in ts) {
+         uint64_t v = [_owner objectForKey:t].unsignedLongLongValue;
+-        if (ended && (v & 0xff) == C_SWAP && [self inSwap:[t locationInView:self]]) swap = YES;   // layout button: counts only when released on the button
++        if ((v & 0xff) == C_SWAP) [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(swapHeldLong) object:nil];
++        if (ended && (v & 0xff) == C_SWAP && !_swapLong && [self inSwap:[t locationInView:self]]) swap = YES;   // layout button: counts only when released on the button (and not held into edit mode)
+         if ((v & 0xff) == C_GAME && (v >> 8) < 16) { _game[v >> 8] = nil; game = YES; }
+         [_owner removeObjectForKey:t]; [_faceOf removeObjectForKey:t]; for (int i = 0; i < 2; i++) if (t == _stick[i]) _stick[i] = nil;
+     }
+@@ -379,26 +498,27 @@ - (void)layoutSubviews {
+     CGFloat u = self.u;
+     [CATransaction begin]; [CATransaction setDisableActions:YES];
+     _controls.frame = self.layer.bounds;
+-    for (int b = B_A; b <= B_Y; b++) { CGPoint c = [self facePos:b]; setPath(_key[b], circlePath(c, self.faceR)); placeLabel(_label[b], c, 20 * u); }
++    for (int b = B_A; b <= B_Y; b++) { CGPoint c = [self facePos:b]; setPath(_key[b], circlePath(c, self.faceR)); placeLabel(_label[b], c, 20 * u * _scl[G_FACE]); }
+     for (int i = 0; i < (int)(sizeof k_btns / sizeof *k_btns); i++) { int b = k_btns[i];
+         if (isDrop(b)) {
+             BOOL right = b == B_ZR || b == B_R; CGPoint c = [self dropCenter:b];
+-            setPath(_key[b], dropPath(c, [self dropR:b], right ? -M_PI_4 : -3 * M_PI_4, 4 * u)); placeLabel(_label[b], c, 16 * u);   // tip toward the near top corner
++            setPath(_key[b], dropPath(c, [self dropR:b], right ? -M_PI_4 : -3 * M_PI_4, 4 * u)); placeLabel(_label[b], c, 16 * u * _scl[dropGroup(b)]);   // tip toward the near top corner
+         } else if (isClick(b)) {
+-            CGPoint c = [self clickCenter:b]; setPath(_key[b], circlePath(c, K_CLICK_R * u)); placeLabel(_label[b], c, 13 * u);
++            CGPoint c = [self clickCenter:b]; setPath(_key[b], circlePath(c, [self clickR:b])); placeLabel(_label[b], c, 13 * u * _scl[b == B_RS ? G_R3 : G_L3]);
+         } else {
+             CGRect rc = [self pillRect:b];
+-            setPath(_key[b], CGPathCreateWithRoundedRect(rc, rc.size.height / 2, rc.size.height / 2, NULL)); placeLabel(_label[b], CGPointMake(CGRectGetMidX(rc), CGRectGetMidY(rc)), 18 * u);
++            setPath(_key[b], CGPathCreateWithRoundedRect(rc, rc.size.height / 2, rc.size.height / 2, NULL)); placeLabel(_label[b], CGPointMake(CGRectGetMidX(rc), CGRectGetMidY(rc)), 18 * u * _scl[b == B_PLUS ? G_PLUS : G_MINUS]);
+         }
+     }
+     static const struct { int b; CGFloat angle; } arms[] = {{B_UP, 0}, {B_RIGHT, M_PI_2}, {B_DOWN, M_PI}, {B_LEFT, -M_PI_2}};   // the same arm in 90° steps
+-    for (int i = 0; i < 4; i++) setPath(_key[arms[i].b], armPath(self.dpadCenter, self.dpadR, K_ARM_W * u, K_ARM_IN * u, arms[i].angle, 6 * u));
++    for (int i = 0; i < 4; i++) setPath(_key[arms[i].b], armPath(self.dpadCenter, self.dpadR, K_ARM_W * u * _scl[G_DPAD], K_ARM_IN * u * _scl[G_DPAD], arms[i].angle, 6 * u));
+     CGPoint sc = self.swapCenter; setPath(_swap, circlePath(sc, K_SWAP_R * u)); placeLabel(_swapLabel, sc, 12 * u);
+     setPath(_ring, circlePath(self.stickHome, [self stickR:0]));
+-    CGFloat k = K_KNOB_R * u; _knob.bounds = CGRectMake(0, 0, 2 * k, 2 * k);
++    CGFloat k = K_KNOB_R * u * _scl[G_STICK]; _knob.bounds = CGRectMake(0, 0, 2 * k, 2 * k);
+     setPath(_knob, circlePath(CGPointMake(k, k), k));
+     CAShapeLayer *in = (CAShapeLayer *)_knob.sublayers.firstObject; CGPathRef ip = circlePath(CGPointMake(k, k), k * 0.62);
+     in.frame = _knob.bounds; in.path = ip; CGPathRelease(ip);
++    [self layoutEdit];
+     [CATransaction commit];
+     [self refresh];
+ }
+@@ -408,6 +528,9 @@ - (void)refresh {   // pressed state → fill, sticks → knob position
+     [CATransaction begin]; [CATransaction setDisableActions:YES];
+     for (int b = 0; b < B_N; b++) { BOOL on = (all >> b) & 1;
+         _key[b].fillColor = (on ? k_on : k_idle).CGColor; _label[b].foregroundColor = (on ? k_textOn : k_text).CGColor; }
++    CGColorRef line = _edit ? [UIColor colorWithRed:1 green:0.8 blue:0.2 alpha:0.9].CGColor : k_line.CGColor;   // edit mode: every control outlined in yellow
++    for (int b = 0; b < B_N; b++) _key[b].strokeColor = line;
++    _ring.strokeColor = line;
+     _swap.fillColor = (_swapHeld ? k_on : k_idle).CGColor; _swapLabel.foregroundColor = (_swapHeld ? k_textOn : k_text).CGColor;
+     CGPoint h = self.stickHome, o = [self knobOffset:0];
+     _knob.position = CGPointMake(h.x + o.x, h.y + o.y); _knob.fillColor = (_stick[0] ? k_on : k_idle).CGColor;
+@@ -420,7 +543,8 @@ static void read_pad(GCExtendedGamepad *g) {
+     dm_haptics_apple_controller(0, g.controller);
+     uint64_t m = 0;
+     #define K(btn, bit) if (btn.isPressed) m |= 1ull << bit
+-    K(g.buttonB, B_A); K(g.buttonA, B_B); K(g.buttonY, B_X); K(g.buttonX, B_Y);   // by position: right A, bottom B, top X, left Y
++    if (pad_xbox()) { K(g.buttonA, B_A); K(g.buttonB, B_B); K(g.buttonX, B_X); K(g.buttonY, B_Y); }   // by label, as printed on an Xbox controller
++    else { K(g.buttonB, B_A); K(g.buttonA, B_B); K(g.buttonY, B_X); K(g.buttonX, B_Y); }   // by position: right A, bottom B, top X, left Y
+     K(g.leftShoulder, B_L); K(g.rightShoulder, B_R); K(g.leftTrigger, B_ZL); K(g.rightTrigger, B_ZR);
+     K(g.buttonMenu, B_PLUS); if (g.buttonOptions) K(g.buttonOptions, B_MINUS);
+     if (g.leftThumbstickButton) K(g.leftThumbstickButton, B_LS); if (g.rightThumbstickButton) K(g.rightThumbstickButton, B_RS);
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index bfd7f33..be04f48 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -6,7 +6,10 @@ import SwiftUI
+ import UIKit
+ import os
+ 
+-private func info(_ key: String) -> Any? { Bundle.main.object(forInfoDictionaryKey: key) }
++// The bundle holding this code: the app, or this game's framework inside a multi-game launcher app (main.m dm_framework_boot), which has its own resources and settings store
++let dmCodeBundle = Bundle(for: LauncherModel.self)
++func dmDefaults() -> UserDefaults { dmCodeBundle == Bundle.main ? .standard : (UserDefaults(suiteName: dmCodeBundle.bundleIdentifier) ?? .standard) }
++private func info(_ key: String) -> Any? { dmCodeBundle.object(forInfoDictionaryKey: key) }
+ 
+ private struct LauncherView: View {
+     @ObservedObject var m: LauncherModel
+@@ -73,17 +76,17 @@ private struct LauncherView: View {
+     }
+ 
+     private func appIcon() -> UIImage? {
+-        if let i = UIImage(named: "AppIcon") { return i }
++        if let i = UIImage(named: "AppIcon", in: dmCodeBundle, compatibleWith: nil) { return i }
+         guard let icons = info("CFBundleIcons") as? [String: Any], let primary = icons["CFBundlePrimaryIcon"] as? [String: Any],
+               let files = primary["CFBundleIconFiles"] as? [String], let last = files.last else { return nil }
+-        return UIImage(named: last)
++        return UIImage(named: last, in: dmCodeBundle, compatibleWith: nil)
+     }
+ }
+ 
+ // Shows the launcher over the root view controller and calls done once the settings are in the environment; false (done is not called) when there is no launcher
+ @_cdecl("dm_show_launcher")
+ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @convention(c) () -> Void) -> Bool {
+-    guard let url = Bundle.main.resourceURL?.appendingPathComponent("dm/launcher.json"), let data = try? Data(contentsOf: url) else { return false }
++    guard let url = dmCodeBundle.resourceURL?.appendingPathComponent("dm/launcher.json"), let data = try? Data(contentsOf: url) else { return false }
+     guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else { fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr); return false }
+     if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); LauncherModel(file.settings).applySaved(); return false }
+     let parent = Unmanaged<UIViewController>.fromOpaque(viewController).takeUnretainedValue()
+diff --git a/dm/ios/Sources/LauncherSettings.swift b/dm/ios/Sources/LauncherSettings.swift
+index dd3385a..ebdde84 100644
+--- a/dm/ios/Sources/LauncherSettings.swift
++++ b/dm/ios/Sources/LauncherSettings.swift
+@@ -43,7 +43,7 @@ final class LauncherModel: ObservableObject {
+ 
+     private let defaults: UserDefaults
+ 
+-    init(_ settings: [Setting], defaults: UserDefaults = .standard) {
++    init(_ settings: [Setting], defaults: UserDefaults = dmDefaults()) {
+         self.defaults = defaults
+         self.settings = settings
+         let env = ProcessInfo.processInfo.environment
+diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
+index 9cd03ba..1d9fc47 100644
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -11,6 +11,7 @@
+ #include "haptics_apple.h"
+ 
+ UIView *dm_gamepad_view(CGRect frame);
++NSBundle *dm_code_bundle(void);   // main.m
+ void dm_gamepad_reset(void);
+ void front_ios_boot(void);
+ int front_ios_boot_ok(void);
+@@ -127,7 +128,7 @@ static void front_ios_power_watch(void) {
+ uint64_t mtl_present_count(void);
+ static UILabel *front_ios_fps_label(void) {
+     const char *e = getenv("DM_SHOW_FPS");
+-    if (!(e ? atoi(e) != 0 : [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMShowFPS"] boolValue])) return nil;
++    if (!(e ? atoi(e) != 0 : [[dm_code_bundle() objectForInfoDictionaryKey:@"DMShowFPS"] boolValue])) return nil;
+     UILabel *l = [UILabel new];
+     l.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold]; l.textColor = UIColor.whiteColor; l.textAlignment = NSTextAlignmentCenter;
+     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45]; l.layer.cornerRadius = 6; l.layer.masksToBounds = YES; l.userInteractionEnabled = NO;
+diff --git a/dm/ios/Sources/main.m b/dm/ios/Sources/main.m
+index eb0f56a..f5903a2 100644
+--- a/dm/ios/Sources/main.m
++++ b/dm/ios/Sources/main.m
+@@ -16,6 +16,21 @@
+ 
+ static char *g_argv[4]; static int g_argc;
+ 
++// The bundle holding this code: the app itself, or a game framework inside a multi-game launcher app (dm_framework_boot), whose resources and Info.plist keys are its own.
++// In a launcher each game also gets its own Documents folder (saves, log, env.txt) and its own settings store
++@interface DmCodeAnchor : NSObject
++@end
++@implementation DmCodeAnchor
++@end
++NSBundle *dm_code_bundle(void) { return [NSBundle bundleForClass:DmCodeAnchor.class]; }
++NSUserDefaults *dm_user_defaults(void) {
++    static NSUserDefaults *d; static dispatch_once_t once;
++    dispatch_once(&once, ^{ NSBundle *b = dm_code_bundle(); d = b == dm_code_bundle() ? NSUserDefaults.standardUserDefaults : [[NSUserDefaults alloc] initWithSuiteName:b.bundleIdentifier]; });
++    return d;
++}
++static NSString *g_doc;
++static NSString *doc_dir(void) { return g_doc ?: NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0]; }
++
+ // Documents/romfs.img, one RomFS image file (dm/tools/romfs_image.py, scripts/push_romfs.sh): only a complete one counts. Its index is written last and ends the file, so a copy cut off partway is skipped
+ static int romfs_image_complete(NSString *path) {
+     romfs_img *m = romfs_image_open(path.fileSystemRepresentation);
+@@ -27,7 +42,7 @@ static int romfs_image_complete(NSString *path) {
+ }
+ static NSString *romfs_locate(void) {
+     NSFileManager *fm = NSFileManager.defaultManager;
+-    NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
++    NSString *doc = doc_dir();
+     NSString *img = [doc stringByAppendingPathComponent:@"romfs.img"];
+     if (romfs_image_complete(img)) {
+         // A folder copy from before images is now dead weight of up to many GB (often cut off partway). Deleting its 300,000 files here took longer than iOS allows an app to start
+@@ -41,11 +56,11 @@ static int romfs_image_complete(NSString *path) {
+         });
+         return img;
+     }
+-    NSString *bundledImage = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"romfs.img"];
++    NSString *bundledImage = [dm_code_bundle().resourcePath stringByAppendingPathComponent:@"romfs.img"];
+     NSString *documentFolder = [doc stringByAppendingPathComponent:@"romfs"];
+     if ([fm fileExistsAtPath:[documentFolder stringByAppendingPathComponent:@DM_GAME_ROMFS_MARKER]]) return documentFolder;
+     if (romfs_image_complete(bundledImage)) return bundledImage;
+-    for (NSString *d in @[[doc stringByAppendingPathComponent:@"romfs"], [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"romfs"]])
++    for (NSString *d in @[[doc stringByAppendingPathComponent:@"romfs"], [dm_code_bundle().resourcePath stringByAppendingPathComponent:@"romfs"]])
+         if ([fm fileExistsAtPath:[d stringByAppendingPathComponent:@DM_GAME_ROMFS_MARKER]]) return d;   // only a directory containing the game profile's romfs_marker path counts (Mario: System/Resource, the resource size table)
+     return nil;
+ }
+@@ -53,8 +68,8 @@ static int romfs_image_complete(NSString *path) {
+ // Boot prerequisites (done before UIApplicationMain): directories / environment variables / log -- the host's early load reads these
+ static int boot_env(void) {
+     NSFileManager *fm = NSFileManager.defaultManager;
+-    NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
+-    NSString *res = NSBundle.mainBundle.resourcePath;
++    NSString *doc = doc_dir();
++    NSString *res = dm_code_bundle().resourcePath;
+     for (NSString *d in @[@"save", @"temp"]) [fm createDirectoryAtPath:[doc stringByAppendingPathComponent:d] withIntermediateDirectories:YES attributes:nil error:nil];
+     // Keep game files and scratch data out of device backups (Documents is backed up by default; a RomFS placed there is many GB). Saves, logs and the pipeline list stay in the backup
+     for (NSString *d in @[@"romfs", @"romfs.img", @"temp"]) {
+@@ -80,7 +95,7 @@ static int boot_env(void) {
+     front_hud_env();   // before the early loading below can make a device
+     // Game language (nn::oe::GetDesiredLanguage, hle_oe.c): the one the IPA was packed with (the NSP script's LANGUAGE / --language → DMLanguage in Info.plist), unless an env file sets DM_LANG
+     // (or the launcher, which replaces this default before the game starts)
+-    NSString *lang = [NSBundle.mainBundle objectForInfoDictionaryKey:@"DMLanguage"];
++    NSString *lang = [dm_code_bundle() objectForInfoDictionaryKey:@"DMLanguage"];
+     if (!getenv("DM_LANG") && [lang isKindOfClass:NSString.class] && lang.length) setenv("DM_LANG", lang.UTF8String, 0);
+     fprintf(stderr, "boot: game language %s\n", getenv("DM_LANG") ?: "en-US");
+     NSString *romfs = romfs_locate();
+@@ -143,6 +158,19 @@ - (void)sceneWillEnterForeground:(UIScene *)s { front_ios_focus_event(2); }
+ - (void)sceneDidBecomeActive:(UIScene *)s { front_ios_focus_event(3); }
+ @end
+ 
++// Multi-game launcher entry: the launcher app dlopens this game's framework, calls this with the game's own Documents folder, then shows front_ios_root() in its window
++// and forwards the scene events to front_ios_focus_event. Returns 0 when the game files are missing (the root view says so)
++__attribute__((visibility("default"))) int dm_framework_boot(const char *doc) {
++    @autoreleasepool {
++        g_doc = @(doc); [NSFileManager.defaultManager createDirectoryAtPath:g_doc withIntermediateDirectories:YES attributes:nil error:nil];
++        g_boot_ok = boot_env();
++    }
++    return g_boot_ok;
++}
++// The host is built with hidden symbols: the launcher reaches the root view controller and the scene events through these
++__attribute__((visibility("default"))) UIViewController *dm_framework_root(void) { return front_ios_root(); }
++__attribute__((visibility("default"))) void dm_framework_focus(int ev) { front_ios_focus_event(ev); }
++
+ int main(int argc, char **argv) {
+     @autoreleasepool { g_boot_ok = boot_env(); }
+     @autoreleasepool { return UIApplicationMain(argc, argv, nil, NSStringFromClass(App.class)); }
+diff --git a/dm/ios/tools/build_ipa.sh b/dm/ios/tools/build_ipa.sh
+index 3b4af1e..c053bae 100755
+--- a/dm/ios/tools/build_ipa.sh
++++ b/dm/ios/tools/build_ipa.sh
+@@ -73,6 +73,9 @@ rm -rf Gen && mkdir -p Gen/dm || die "mkdir Gen"
+ python3 tools/gen_build.py "$DM/host" Gen > Gen/dm.xcconfig || die "gen_build"
+ F=$(python3 tools/gen_embed.py "$PATCHED" Gen/embed.S $MODS) || die "gen_embed"
+ echo "OTHER_LDFLAGS = \$(inherited) \$(DM_FRAMEWORKS) $F" >> Gen/dm.xcconfig
++# DM_AS_DYLIB=1: the app's executable is a dynamic library, for a multi-game launcher app that dlopens one game's bundle (main.m dm_framework_boot); the host finds its embedded
++# sections in its own image, not the launcher's executable (__dso_handle is the header of the image that holds the code)
++if [ "${DM_AS_DYLIB:-0}" = 1 ]; then printf '%s\n' 'MACH_O_TYPE = mh_dylib' 'LD_DYLIB_INSTALL_NAME = @rpath/DmIOS' 'OTHER_CFLAGS = $(inherited) -D_mh_execute_header=__dso_handle' >> Gen/dm.xcconfig; t "executable: dynamic library (DM_AS_DYLIB=1)"; fi
+ cp "$PATCHED"/*.fixups.tsv "$PATCHED"/*.gates.tsv "$PATCHED"/*.cuts.tsv "$PATCHED"/*.obs.tsv Gen/dm/ || die "copy rewriter tables"
+ if [ -f "$PATCHED/nro.tsv" ]; then cp "$PATCHED/nro.tsv" Gen/dm/ || die "copy the NRO table"; fi   # the NRO modules the game loads with nn::ro (hle_ro.c), embedded by gen_embed.py
+ if [ "$GFXAPI" = vulkan ] || [ "$GFXAPI" = gl ]; then cp "$GD/shader_map.tsv" "$GD/pso_manifest.tsv" Gen/dm/ || die "copy shader tables"   # empty NVN tables: the NVN layer draws nothing
+@@ -145,6 +148,10 @@ xcodebuild -project DmIOS.xcodeproj -scheme DmIOS -configuration Release -destin
+ # SYMROOT and OBJROOT above keep the unsigned build separate from the interactive Xcode app.
+ APP=$DD/Build/Products/Release-iphoneos/DmIOS.app
+ [ -n "$APP" ] && [ -d "$APP" ] || die "no built app"; t "app: $APP"
++# DM_SKIP_PACK=1: a code update only: the built app (code, tables, icon; no RomFS, shaders or add-on content) goes next to the output as <name>.app, no IPA is packed
++if [ "${DM_SKIP_PACK:-0}" = 1 ]; then CODE_APP=${OUT_IPA%.ipa}.app
++  rsync -a --delete --exclude msl --exclude romfs --exclude romfs.img --exclude aoc --exclude pso --exclude _CodeSignature "$APP/" "$CODE_APP/" || die "copy the code app"
++  t "done: $CODE_APP (code only, $(du -sh "$CODE_APP" | cut -f1); DM_SKIP_PACK=1)"; exit 0; fi
+ 
+ # Straight from the sources: the app without its signature, and without the folders an app built before pack_ipa.py still has (DerivedData keeps resources that left the project;
+ # msl/ is also deleted there, it took 1.5 GB of the home disk), then the shader libraries, the add-on content (the RomFS extracted from the player's DLC NSPs, one folder per index:
+diff --git a/dm/tools/nx_extract/Program.cs b/dm/tools/nx_extract/Program.cs
+index e8c1392..82b4a80 100644
+--- a/dm/tools/nx_extract/Program.cs
++++ b/dm/tools/nx_extract/Program.cs
+@@ -33,10 +33,10 @@ static class P {
+         bool manifest = Array.IndexOf(a, "--manifest") >= 0; a = Array.FindAll(a, s => s != "--manifest");
+         bool image = Array.IndexOf(a, "--romfs-image") >= 0; a = Array.FindAll(a, s => s != "--romfs-image");
+         g_allow = Array.IndexOf(a, "--allow-damaged") >= 0; a = Array.FindAll(a, s => s != "--allow-damaged");
+-        if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--romfs-image|--manifest] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir or image> [--romfs-image]"); return 2; }
++        if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--romfs-image|--manifest] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir or image> [DLC title ID] [--romfs-image]"); return 2; }
+         KeySet ks = ExternalKeyReader.ReadKeyFile(a[0]);
+-        if (a[1] == "--aoc") return Aoc(ks, a[2], a[3], image);
+-        var basePkg = OpenNsp(ks, a[1], ContentMetaType.Application); var updPkg = a[2] == "-" ? null : OpenNsp(ks, a[2]);
++        if (a[1] == "--aoc") return Aoc(ks, a[2], a[3], image, a.Length > 4 ? Convert.ToUInt64(a[4], 16) : null);   // [DLC title ID]: one DLC of a merged NSP (1G+1U+2D)
++        var basePkg = OpenNsp(ks, a[1], ContentMetaType.Application); var updPkg = a[2] == "-" ? null : OpenNsp(ks, a[2], ContentMetaType.Patch);   // only the patch's NCAs: a merged NSP (1G+1U) is both the base and the update
+         Nca baseProg = Pick(basePkg, NcaContentType.Program) ?? throw new Exception("no Program NCA in the base NSP");
+         Nca updProg = updPkg == null ? null : Pick(updPkg, NcaContentType.Program, baseProg.Header.TitleId) ?? throw new Exception("no Program NCA of the base game's program in the update NSP");
+         Nca ctrl = Pick(updPkg ?? basePkg, NcaContentType.Control, baseProg.Header.TitleId);
+@@ -91,9 +91,9 @@ static class P {
+     }
+ 
+     // DLC NSP: one data NCA (content type PublicData / Data) + a meta NCA + the ticket; only the data NCA's RomFS is written
+-    static int Aoc(KeySet ks, string nsp, string outDir, bool image) {
++    static int Aoc(KeySet ks, string nsp, string outDir, bool image, ulong? tid = null) {
+         var pkg = OpenNsp(ks, nsp);
+-        Nca data = Pick(pkg, NcaContentType.PublicData) ?? Pick(pkg, NcaContentType.Data) ?? throw new Exception("no data NCA in the DLC NSP");
++        Nca data = Pick(pkg, NcaContentType.PublicData, tid) ?? Pick(pkg, NcaContentType.Data, tid) ?? throw new Exception($"no data NCA{(tid != null ? $" of {tid:x16}" : "")} in the DLC NSP");
+         Console.WriteLine($"add-on content {data.Header.TitleId:x16}");
+         Directory.CreateDirectory(image ? Path.GetDirectoryName(outDir) : outDir);
+         var fs = new RomFsFileSystem(data.OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid));
+diff --git a/dm/tools/patch_nso.py b/dm/tools/patch_nso.py
+index 7e02476..e6f6095 100644
+--- a/dm/tools/patch_nso.py
++++ b/dm/tools/patch_nso.py
+@@ -661,7 +661,7 @@ def jump_adr_offsets(insl, j):
+             if m and m.group(1) in idx: idx.add(m.group(2)); continue
+             m = re.fullmatch(r'(w\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'cmp' else None
+             if m and m.group(1) in idx: cmp = p; break
+-            if any('w' + p.reg_name(r)[1:] in idx for r in p.regs_access()[1]): return None   # the index changes after the check
++            if any(p.reg_name(r)[0] in 'wx' and 'w' + p.reg_name(r)[1:] in idx for r in p.regs_access()[1]): return None   # the index changes after the check (a vector load such as ldr s0 is not w0: Tomodachi Life: Living the Dream main+0x3ce58)
+         if cmp is None: return None
+         n, at = int(cmp.op_str.split('#')[1], 0) + 1, wa.operands[1].imm
+         def targets(tb): return [at + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)] if 0 <= tb and tb + 4 * n <= len(IMG) else None
+diff --git a/scripts/build_ipa_from_nsp.py b/scripts/build_ipa_from_nsp.py
+index e3a9231..dbd6011 100755
+--- a/scripts/build_ipa_from_nsp.py
++++ b/scripts/build_ipa_from_nsp.py
+@@ -410,11 +410,18 @@ def pfs0_names(path):   # NSP = PFS0: list the file names inside
+     return [strs[o:strs.index(b'\0', o)].decode(errors='replace') for o in (struct.unpack_from('<I', ent, i * 0x18 + 0x10)[0] for i in range(n))]
+ 
+ 
++def tickets_of(path):   # the title IDs of the tickets in a package (the first 16 digits of each rights ID)
++    return [int(n[:16], 16) for n in pfs0_names(path) if re.match(r'[0-9A-Fa-f]{32}\.tik$', n)]
++
++
+ def title_of(path):   # the ticket name (the first 16 digits of the rights ID = title ID), else [title ID] in the file name
+-    for n in pfs0_names(path):   # the ticket first: a file name's tag can be wrong (FFT's base NSP is tagged …0001, its ticket is …0000)
+-        if re.match(r'[0-9A-Fa-f]{32}\.tik$', n): return int(n[:16], 16)
++    # the ticket first: a file name's tag can be wrong (FFT's base NSP is tagged …0001, its ticket is …0000); a merged NSP (1G+1U) holds the base's and the update's, the lowest is the base's
++    tiks = tickets_of(path)
+     m = re.search(r'\[([0-9A-Fa-f]{16})\]', path.name)
+-    return int(m.group(1), 16) if m else None
++    tag = int(m.group(1), 16) if m else None
++    # ...or only the update's (Tears of the Kingdom "(1G+1U)": the base needs no ticket): a name tagged with the base's ID whose ticket is that game's update is the base game
++    if tiks and tag is not None and tag & 0xFFF == 0 and min(tiks) == tag | 0x800: return tag
++    return min(tiks) if tiks else tag
+ 
+ 
+ def version_of(path):
+@@ -439,7 +446,11 @@ def scan_nsps(nsp_dir):
+         low = tid & 0xFFF   # base …000, update …800, DLC = base + 0x1000 + index
+         app = tid if low == 0 else tid & ~0xFFF if low == 0x800 else (tid & ~0xFFF) - 0x1000
+         f = fams.setdefault(app, {'base': None, 'updates': [], 'dlc': []})
+-        if low == 0: f['base'] = p
++        if low == 0:
++            f['base'] = p
++            if version_of(p): f['updates'].append((version_of(p), p))   # a merged NSP (base + update, "(1G+1U)") named after its update's version holds that update too
++            for t in tickets_of(p):   # ...and its DLC ("(1G+1U+2D)"): each DLC ticket's title ID belongs to this game (extract_aoc picks that DLC's data NCA in the file)
++                if t & 0xFFF and t & 0xFFF != 0x800 and (t & ~0xFFF) - 0x1000 == app: f['dlc'].append((t, version_of(p), p))
+         elif low == 0x800: f['updates'].append((version_of(p), p))
+         else: f['dlc'].append((tid, version_of(p), p))
+     if len(fams) == 1 and len(unknown) == 1 and next(iter(fams.values()))['base'] is None:   # a base game converted from a cartridge may have neither tags nor a ticket; build IDs are checked afterwards
+@@ -898,7 +909,7 @@ def extract_aoc(nx, keys, repo, work, app, fam, logs):
+         idx = tid - app - 0x1000
+         PROG.set(step='extracting', done=i, total=len(best), unit='DLC')
+         say(f'DLC index {idx}: {p.name}')
+-        run([nx, keys, '--aoc', p, tmp / f'{idx}.img', '--romfs-image'], logs / f'aoc_{idx}.log')
++        run([nx, keys, '--aoc', p, tmp / f'{idx}.img', f'{tid:016x}', '--romfs-image'], logs / f'aoc_{idx}.log')
+     swap_in(tmp, dst)
+     kf.write_text(f'{key}\n{len(best)} DLC\n')
+     PROG.end(f'{len(best)} DLC')
+@@ -2142,6 +2153,10 @@ def main(args=None):
+     watch = IpaWatch(repo, work / 'ipa', out_ipa)
+     PROG.stage('app build', poll=watch.poll, step='starting')   # build_ipa.sh's "pack IPA" line starts the stage "IPA pack"
+     run(['bash', repo / 'dm/ios/tools/build_ipa.sh', out_ipa], logs / 'build_ipa.log', env=ipa_env, on_line=watch.line)
++    if os.environ.get('DM_SKIP_PACK') == '1':   # a code update only (build_ipa.sh): the code app next to the output, no IPA
++        code = out_ipa.with_suffix('.app')
++        if not code.is_dir(): raise BuildError(f'no code app at {code}')
++        PROG.end(f'{code.name}, code only'); say(f'done: {code} (code only, DM_SKIP_PACK=1)'); return 0
+     if not out_ipa.is_file(): raise BuildError(f'no IPA at {out_ipa}')
+     PROG.end(f'{out_ipa.name}, {amount(out_ipa.stat().st_size, "B")}')
+     rmtree(work / 'tmp')
+@@ -2173,5 +2188,10 @@ def cli(argv):   # returns the exit code: 0 done, 1 error, 130 interrupted
+ 
+ 
+ if __name__ == '__main__':
++    # One build at a time in this checkout: iOS builds share dm/ios/Gen (embed.S, the copied tables), so two at once put one game's code into the other's app
++    import fcntl
++    _lock = open(Path(__file__).resolve().parents[1] / 'dm/ios/.build.lock', 'w')
++    try: fcntl.flock(_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++    except BlockingIOError: print('another build_ipa_from_nsp.py run holds dm/ios/.build.lock: waiting for it to finish', flush=True); fcntl.flock(_lock, fcntl.LOCK_EX)
+     code = cli(sys.argv[1:])
+     if not in_ipython(): sys.exit(code)   # give an exit code in a terminal; do not exit in Spyder (keeps the console clean)

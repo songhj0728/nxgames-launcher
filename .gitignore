@@ -1,0 +1,16 @@
+# your own settings
+config.sh
+games.tsv
+# builds, logs, game data
+build/
+app/Gen/
+app/NXLauncher.xcodeproj/
+stub/Info.plist
+stub/Stub.xcodeproj/
+*.ipa
+*.log
+*.keys
+*.nsp
+*.nsz
+*.xci
+.DS_Store

@@ -1,0 +1,7 @@
+# Copy to games.tsv (git-ignored). One row per game, tab-separated:
+# name	game folder (its NSPs: base, update, DLC, or one merged NSP)	extra build_ipa_from_nsp.py arguments
+# tools/build_game.sh <name> reads its row; the patched code and control.nacp are found in the game folder's <title ID>_build.
+botw	/path/to/Games/BotW	-p v1114112 --env-file env/botw.txt
+tomodachi	/path/to/Games/Tomodachi	-p v0
+rhythm	/path/to/Games/RHG
+acnh	/path/to/Games/ACNH
